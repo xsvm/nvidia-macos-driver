@@ -1,0 +1,96 @@
+# Builds NVK (libvulkan_nouveau.dylib) the way build/build263.sh does, from Mesa MESA_BASE with the nvk/ patches,
+# and runs the repository's static checks. "base" applies the shipped patches only; "lazy" adds nvk-event-lazy.patch,
+# so a failure in "lazy" alone is the new patch's and the two dylibs can be compared on a real machine.
+name: nvk-build
+
+on:
+  push:
+    branches: ["perf/**", "fix/**"]
+  workflow_dispatch:
+
+jobs:
+  static-checks:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # Some checks already fail on main (they read files or commits a clone does not have), so a check fails this
+      # job only when it passes on main and fails here.
+      - name: Repository checks (tools/test_*.py, tools/check_*.py), new failures only
+        run: |
+          git worktree add -q --detach ../main origin/main
+          fail=0
+          for t in tools/test_*.py tools/check_*.py; do
+            if perl -e 'alarm 120; exec @ARGV' python3 "$t" > "/tmp/$(basename "$t").log" 2>&1; then echo "ok   $t"; continue; fi
+            if [ -f "../main/$t" ] && ! (cd ../main && perl -e 'alarm 120; exec @ARGV' python3 "$t" > /dev/null 2>&1); then
+              echo "skip $t (fails on main too)"; continue; fi
+            echo "FAIL $t (passes on main)"; tail -20 "/tmp/$(basename "$t").log"; fail=1
+          done
+          exit $fail
+
+  nvk:
+    runs-on: macos-15-intel
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, lazy]
+    env:
+      OGKM_TAG: 610.57.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: repo }
+
+      - name: Tools
+        run: |
+          brew install meson ninja llvm spirv-llvm-translator libclc cbindgen bindgen glslang pkgconf
+          python3 -m pip install --break-system-packages mako pyyaml packaging
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Mesa source with the nvk patches
+        run: |
+          base=$(cat repo/nvk/MESA_BASE)
+          curl -fsSL -o mesa.tar.gz "https://gitlab.freedesktop.org/mesa/mesa/-/archive/$base/mesa-$base.tar.gz"
+          mkdir mesa && tar -xzf mesa.tar.gz -C mesa --strip-components=1
+          cd mesa
+          for p in nvk-macos.patch nvk-fixes-after-def16.patch nvk-620-kernel.patch; do
+            patch -p1 -s --forward < "../repo/nvk/$p"
+          done
+          if [ "${{ matrix.variant }}" = lazy ]; then patch -p1 -s --forward < ../repo/nvk/nvk-event-lazy.patch; fi
+
+      - name: open-gpu-kernel-modules headers
+        run: |
+          git clone -q --depth 1 --branch "$OGKM_TAG" https://github.com/NVIDIA/open-gpu-kernel-modules ogkm
+          (cd ogkm && patch -p1 -s --forward < ../repo/nvk/ogkm-nvos-620.patch)
+          ln -s "$PWD/ogkm" mesa/src/nouveau/vulkan/nvkmd/nvrm/open-gpu-kernel-modules
+
+      - name: mesa_clc and vtn_bindgen2 (host tools)
+        run: |
+          meson setup build-clc mesa -Dbuildtype=release -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+            -Dllvm=enabled -Dvulkan-drivers= -Dgallium-drivers= -Dplatforms= -Degl=disabled -Dglx=disabled \
+            -Dglvnd=disabled -Dtools= -Dbuild-tests=false -Dzstd=disabled -Dexpat=disabled
+          ninja -C build-clc src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2
+          mkdir -p hostbin
+          cp build-clc/src/compiler/clc/mesa_clc build-clc/src/compiler/spirv/vtn_bindgen2 hostbin/
+          echo "$PWD/hostbin" >> "$GITHUB_PATH"
+
+      - name: NVK (build263.sh options)
+        run: |
+          meson setup build mesa -Dbuildtype=debugoptimized -Dvulkan-drivers=nouveau -Dgallium-drivers= -Dplatforms= \
+            -Degl=disabled -Dglx=disabled -Dglvnd=disabled -Dllvm=disabled -Dmesa-clc=system -Dshared-glapi=disabled \
+            -Dvulkan-layers= -Dtools= -Dbuild-tests=false -Dexpat=disabled -Dzstd=disabled -Dlibunwind=disabled \
+            -Dlmsensors=disabled -Dvalgrind=disabled -Dxlib-lease=disabled -Dgallium-rusticl=false -Dspirv-tools=disabled
+          ninja -C build src/nouveau/vulkan/libvulkan_nouveau.dylib
+
+      - name: No unresolved strong references
+        run: |
+          D=build/src/nouveau/vulkan/libvulkan_nouveau.dylib
+          U=$(nm -m "$D" | grep '(undefined)' | grep -v weak | grep 'dynamically looked up' || true)
+          [ -z "$U" ] || { echo "unresolved strong references (dlopen fails in WindowServer):"; echo "$U"; exit 1; }
+          lipo -info "$D"
+          mkdir out && cp "$D" out/ && strip -S out/libvulkan_nouveau.dylib
+          shasum -a 256 out/libvulkan_nouveau.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libvulkan_nouveau-${{ matrix.variant }}
+          path: out/libvulkan_nouveau.dylib
