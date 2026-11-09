@@ -505,6 +505,21 @@ uint32_t nvmtl_air_text_flags(NSString *ll) {
     if (keep) objc_setAssociatedObject(ll, NVMTL_AIRFLAGS_KEY, @(f), OBJC_ASSOCIATION_RETAIN);
     return f;
 }
+// The first 8 bytes of the sha256 of the module's UTF-8 text, for nvmtl_function_air_key. VideoToolbox makes a new
+// function for the same module on every transfer, so the key is kept on the text and not only on the function.
+static const void *NVMTL_AIRKEY_KEY = &NVMTL_AIRKEY_KEY;
+uint64_t nvmtl_air_text_key(NSString *ll) {
+    if (!ll.length) return 0;
+    const BOOL keep = ll.length >= 4096 && objc_getAssociatedObject(ll, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *have = keep ? objc_getAssociatedObject(ll, NVMTL_AIRKEY_KEY) : nil;
+    if (have) return have.unsignedLongLongValue;
+    const char *s = ll.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH]; uint64_t v = 0;
+    if (!s) return 0;
+    CC_SHA256(s, (CC_LONG)strlen(s), dg);
+    for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
+    if (keep) objc_setAssociatedObject(ll, NVMTL_AIRKEY_KEY, @(v), OBJC_ASSOCIATION_RETAIN);
+    return v;
+}
 static NVMTLAirDigest *nvmtl_air_state(NSString *ll) {
     if (!ll) return nil;
     // Only long strings we marked: every CF-backed string is a kind of NSMutableString, so a class test keeps nothing.
@@ -1920,9 +1935,23 @@ static BOOL nvmtl_air_grid_only_scan(NSString *ll, NSString *fname)
     }
     return NO;
 }
+// The pipeline state keeps this answer, but VideoToolbox's Metal scaler makes a new pipeline state on every transfer,
+// so the answer is also kept on the module text by function name, as nvmtl_air_max_tg does.
+static const void *NVMTL_AIRGRID_KEY = &NVMTL_AIRGRID_KEY;
 BOOL nvmtl_air_grid_only(NVMTLFunction *fn)
 {
-    return fn ? nvmtl_air_grid_only_scan(fn->_air, fn->_fname) : NO;
+    NSString *ll = fn ? fn->_air : nil, *fname = fn ? fn->_fname : nil;
+    if (!ll.length || !fname.length) return NO;
+    NSMutableDictionary *memo = nil;
+    if (ll.length >= 4096 && objc_getAssociatedObject(ll, NVMTL_AIRTEXT_KEY)) @synchronized (ll) {
+        memo = objc_getAssociatedObject(ll, NVMTL_AIRGRID_KEY);
+        if (!memo) { memo = [NSMutableDictionary new]; objc_setAssociatedObject(ll, NVMTL_AIRGRID_KEY, memo, OBJC_ASSOCIATION_RETAIN); }
+        NSNumber *known = memo[fname];
+        if (known) return known.boolValue;
+    }
+    const BOOL only = nvmtl_air_grid_only_scan(ll, fname);
+    if (memo) @synchronized (ll) { memo[fname] = @(only); }
+    return only;
 }
 
 // One `air.struct_type_info` tuple: members of `i32 offset, i32 size, i32 count, !"type", !"name",
@@ -2351,9 +2380,18 @@ static NVMTLFunction *nvmtl_link_dylibs(NVMTLFunction *fn, NSArray *dylibs, NSEr
 // survived specialization, and translation refused the module on the null compare its result feeds - 76
 // refusals and not one "reads a visible function table" line in the run. Ask for the intrinsics, which are what
 // actually reads the table; the metadata stays as a second form so a module that does carry it still matches.
+// VideoToolbox's Metal scaler makes its function again on every transfer, and each time both answers below were
+// worked out from the whole module again: megabytes of text searched for eight strings and handed to the translator,
+// on a dozen transfer threads at once (System Settings > Displays held DisplaysExt at 800% CPU). The text is never
+// edited, so each answer is kept on it once known.
+static const void *NVMTL_AIRFNTABLE_KEY = &NVMTL_AIRFNTABLE_KEY;
+static const void *NVMTL_AIRVLINK_KEY = &NVMTL_AIRVLINK_KEY;
 BOOL nvmtl_air_reads_function_table(NSString *air)
 {
     if (!air.length) return NO;
+    const BOOL keep = air.length >= 4096 && objc_getAssociatedObject(air, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *have = keep ? objc_getAssociatedObject(air, NVMTL_AIRFNTABLE_KEY) : nil;
+    if (have) return have.boolValue;
     static NSArray<NSString *> *forms;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -2366,9 +2404,11 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.visible_function_table\"",
                   @"!\"air.intersection_function_table\""];
     });
+    BOOL reads = NO;
     for (NSString *f in forms)
-        if ([air rangeOfString:f].location != NSNotFound) return YES;
-    return NO;
+        if ([air rangeOfString:f].location != NSNotFound) { reads = YES; break; }
+    if (keep) objc_setAssociatedObject(air, NVMTL_AIRFNTABLE_KEY, @(reads), OBJC_ASSOCIATION_RETAIN);
+    return reads;
 }
 
 // Whether a function needs linking before it can be translated: it calls visible functions it does not define,
@@ -2381,6 +2421,10 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
 // that cannot answer, so a query that cannot run never reads as "no references".
 BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
 {
+    // Only the translator's answer is kept: it depends on the module alone. The error-text fallback depends on why.
+    const BOOL keep = air.length >= 4096 && objc_getAssociatedObject(air, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *have = keep ? objc_getAssociatedObject(air, NVMTL_AIRVLINK_KEY) : nil;
+    if (have) return have.boolValue;
     if (air.length && nvmtl_xlate_ready() && xlate_vrefs) {
         uint8_t *out = NULL; size_t len = 0; char e[256] = {0};
         if (xlate_vrefs(air.UTF8String, &out, &len, e, sizeof e) == 0) {
@@ -2388,8 +2432,11 @@ BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
             xlate_free(out, len);
             // the query lists direct references only; a function that calls through a visible or intersection
             // function table has none, and nvmtl_link_stage links it from the table candidates
-            if ([refs isKindOfClass:[NSArray class]])
-                return [(NSArray *)refs count] > 0 || nvmtl_air_reads_function_table(air);
+            if ([refs isKindOfClass:[NSArray class]]) {
+                const BOOL need = [(NSArray *)refs count] > 0 || nvmtl_air_reads_function_table(air);
+                if (keep) objc_setAssociatedObject(air, NVMTL_AIRVLINK_KEY, @(need), OBJC_ASSOCIATION_RETAIN);
+                return need;
+            }
         }
     }
     return why && ([why rangeOfString:@"visible function reference"].location != NSNotFound
