@@ -67,7 +67,8 @@ static void nvbt(const char *tag, int *count, int max);
         b->_b = b->_shadow; memset(&b->_shadow, 0, sizeof b->_shadow);
         return b;
     }
-    if (nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
+    // Unaligned ranges too (nvmtl_vk_buffer_import_host_range): the pages around them are imported.
+    if (nvmtl_vk_buffer_import_host_range(a0, a1, &b->_b) == 0) {
         static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: IMPORTED the caller's pages (%lu bytes at %p) \u2014 zero copy", (unsigned long)a1, a0);
         return b;
     }

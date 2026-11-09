@@ -141,6 +141,7 @@ uint64_t nvmtl_perf_now(void);
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
 int  nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out);
 size_t nvmtl_vk_host_import_align(void);
+int nvmtl_vk_buffer_import_host_range(void *ptr, size_t size, nvk_buffer *out);
 #define NVMTL_MAX_GEOMS 256
 typedef struct { void *as; uint64_t addr; size_t size; int instance; } nvk_accel;
 typedef struct { uint64_t vertices; uint32_t stride; uint32_t count; uint32_t vertex_format; uint32_t max_vertex;

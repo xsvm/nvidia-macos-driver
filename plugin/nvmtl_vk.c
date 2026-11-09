@@ -1942,6 +1942,62 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
     return 0;
 }
 
+/* newBufferWithBytesNoCopy hands over memory that is often not page-aligned: WindowServer's CoreAnimation wraps every
+ * CPU image it uploads (window snapshots for the full-screen and Mission Control animations, shadows, icons) this way.
+ * nvmtl_vk_buffer_import_host refuses such a pointer, and the buffer was then COPIED by the CPU at creation and again,
+ * whole, before every submission that used it: on a 4K desktop that was tens of MB per snapshot, 45-78% of
+ * WindowServer's busy time, and the animations dropped frames. Here the whole pages that hold the range are imported
+ * and the buffer is bound at the range's offset inside them, so the GPU reads the caller's bytes where they are.
+ * The buffer leaves out uniform-buffer usage: Metal buffers are reached by device address (only this plugin's own
+ * tables are uniform buffers), and without it a buffer needs 16-byte alignment instead of 64, which malloc gives.
+ * The other bytes of the first and last page are mapped for the GPU but never addressed by this buffer. */
+int nvmtl_vk_buffer_import_host_range(void *ptr, size_t size, nvk_buffer *out)
+{
+    if (nvmtl_vk_init()) return -1;
+    memset(out, 0, sizeof *out);
+    if (!g_host_import || !pvkGetMemoryHostPointerPropertiesEXT || !g_host_align || !ptr || !size) return -1;
+    const uintptr_t p = (uintptr_t)ptr, a = (uintptr_t)g_host_align;
+    if (!(p & (a - 1)) && !(size & (a - 1))) return nvmtl_vk_buffer_import_host(ptr, size, out);
+    const uintptr_t base = p & ~(a - 1);
+    const size_t delta = (size_t)(p - base);
+    if (size > SIZE_MAX - delta - (a - 1)) return -1;
+    const size_t span = (delta + size + (a - 1)) & ~(size_t)(a - 1);
+    VkMemoryHostPointerPropertiesEXT mhp = { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT, NULL, 0 };
+    if (pvkGetMemoryHostPointerPropertiesEXT(g_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)base, &mhp) != VK_SUCCESS
+        || !mhp.memoryTypeBits) return -1;
+    VkExternalMemoryBufferCreateInfo emb = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL,
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &emb, 0, size,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | NVMTL_RT_BUFFER_USAGE,
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+    if (nvmtl_opaque_CreateBuffer(g_dev, &bci, NULL, &out->buf) != VK_SUCCESS) { out->buf = NULL; return -1; }
+    VkMemoryRequirements mr; pvkGetBufferMemoryRequirements(g_dev, (VkBuffer)out->buf, &mr);
+    const int mt = memtype(mr.memoryTypeBits & mhp.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0 || (mr.alignment && delta % (size_t)mr.alignment) || mr.size > span - delta) {
+        static int said; if (!said++) nvlog("vk: page-range import refused - offset %zu in its page, buffer alignment %llu, memory type %d; that buffer is COPIED",
+                                            delta, (unsigned long long)mr.alignment, mt);
+        pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL); out->buf = NULL; return -1; }
+    VkMemoryAllocateFlagsInfo mafi = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL,
+                                       VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0 };
+    VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, &mafi,
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)base };
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, span, (uint32_t)mt };
+    if (nvmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem) != VK_SUCCESS) {
+        pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL); out->buf = NULL; out->mem = NULL; return -1; }
+    if (pvkBindBufferMemory(g_dev, (VkBuffer)out->buf, (VkDeviceMemory)out->mem, delta) != VK_SUCCESS) {
+        pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
+        out->buf = NULL; out->mem = NULL; return -1; }
+    out->size = size; out->map = ptr; out->alloc = span; out->moff = delta; out->imported = 1; out->mtype1 = mt + 1;
+    g_alloc_bytes += span; g_buf_made++;
+    nvmtl_live_add(out, NVMTL_LV_IMPORTED);
+    { static int said; if (!said++) nvlog("vk: imported the pages around an unaligned host range - %zu bytes at %p, offset %zu in %zu bytes",
+                                          size, ptr, delta, span); }
+    return 0;
+}
+
 static pthread_key_t g_stage_key; static pthread_once_t g_stage_once = PTHREAD_ONCE_INIT;
 static void nvmtl_stage_free(void *p) { nvk_buffer *b = p; nvmtl_vk_buffer_destroy(b); free(b); }
 static void nvmtl_stage_key_make(void) { if (pthread_key_create(&g_stage_key, nvmtl_stage_free)) nvlog("stage: pthread_key_create FAILED"); }
