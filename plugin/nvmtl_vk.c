@@ -8696,35 +8696,6 @@ static int nvmtl_surfin_ordered_on(void)
     if (on < 0) { const char *e = getenv("NVMTL_SURFIN_ORDERED"); on = !(e && e[0] == '0'); nvlog("ordered surface-in %s (NVMTL_SURFIN_ORDERED=%s)", on ? "on" : "off", e ? e : "unset"); }
     return on;
 }
-int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache)
-{
-    const size_t bpp = img->bpp ? img->bpp : 4;
-    // bufferRowLength counts texels, so the row pitch has to be a whole number of them
-    if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
-    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
-    if ((size_t)img->h * row_bytes > bytes) return -1;
-    nvk_buffer tmp, *hp = nvmtl_host_pages(cache, base, bytes, &tmp);
-    if (!hp) return -1;
-    nvk_buffer hb = *hp;
-    nvk_cmdbuf c;
-    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_host_pages_done(cache, hp); return -1; }
-    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, nvmtl_surfin_ordered_on() ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, nvmtl_surfin_ordered_on() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
-    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
-    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
-    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (imported pages)");
-    nvmtl_host_pages_done(cache, hp);
-    return rc;
-}
 
 // A CPU-written IOSurface is uploaded at bind time (nvmtlSurfaceIn). Waiting for that copy put one GPU round trip
 // into every bind of a changed surface: Chromium with CPU raster binds a fresh tile surface per draw and its GPU
@@ -8732,13 +8703,16 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
 // path: it has its own staging buffer, queue order and its SHADER_READ barrier put it before the draw that samples
 // the image, and the handle is finished before a readback, destroy or re-upload. Apps only: WindowServer's surfaces
 // keep the synchronous upload. NVMTL_ASYNC_SURFACE_UPLOAD=0 turns it off.
+// WindowServer too, now, and for the imported-pages upload (nvmtl_vk_image_write_host) as well: its composite waited
+// for every changed window's copy in the middle of recording a frame, a GPU round trip per window per frame while
+// scrolling, and that is where the dropped scroll frames went.
 static __thread int g_up_force_async;   // set by nvmtl_vk_image_write for one surface upload
 static int nvmtl_async_surface_upload(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("NVMTL_ASYNC_SURFACE_UPLOAD"), *me = getprogname();
-        on = e ? e[0] == '1' : !(me && !strcmp(me, "WindowServer"));
+        on = e ? e[0] == '1' : 1; (void)me;
         nvlog("vk: async surface upload %s (NVMTL_ASYNC_SURFACE_UPLOAD=%s)", on ? "ON" : "OFF", e ? e : "unset");
     }
     return on;
@@ -8969,6 +8943,51 @@ static void nvmtl_asyncup_finish(uint64_t token)
 }
 // Public guard for the consumers (readback, surface-out, migration, destroy): finish a pending upload first.
 void nvmtl_vk_image_upload_barrier(nvk_image *img) { nvmtl_asyncup_finish(nvmtl_asyncup_take(img)); }
+
+int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    // bufferRowLength counts texels, so the row pitch has to be a whole number of them
+    if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
+    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
+    if ((size_t)img->h * row_bytes > bytes) return -1;
+    // A previous upload to this image must land before the image is overwritten again or the pages it reads from are
+    // reused or replaced (nvmtl_host_pages drops a cache whose pages moved).
+    nvmtl_vk_image_upload_barrier(img);
+    nvk_buffer tmp, *hp = nvmtl_host_pages(cache, base, bytes, &tmp);
+    if (!hp) return -1;
+    nvk_buffer hb = *hp;
+    nvmtl_asyncup *au = nvmtl_async_surface_upload() && (img->layers ? img->layers : 1) == 1 ? calloc(1, sizeof *au) : NULL;
+    nvk_cmdbuf local_cb, *const cp = au ? &au->cb : &local_cb;
+    if (nvmtl_vk_cmd_begin(q, cp)) { free(au); nvmtl_host_pages_done(cache, hp); return -1; }
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, nvmtl_surfin_ordered_on() ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(cp->cb, nvmtl_surfin_ordered_on() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyBufferToImage(cp->cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(cp->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (au) {
+        // Not waited for: queue order and the SHADER_READ barrier put the copy before the draw that samples the image,
+        // the next upload, a readback or the image's destroy finish it first (nvmtl_vk_image_upload_barrier), and a
+        // temporary import is kept on the handle until then. A cached import dropped meanwhile (the texture died, or
+        // the surface's pages moved) is held by the buffer grace until this submit completes.
+        if (hp != cache) au->stage = *hp;
+        if (nvmtl_vk_submit_begin_at(cp, &au->infl, "surface upload async (imported pages)")) {
+            nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+        nvmtl_asyncup_store(img, (uint64_t)(uintptr_t)au);
+        return 0;
+    }
+    const int rc = nvmtl_vk_submit_wait_at(cp, "surface upload (imported pages)");
+    nvmtl_host_pages_done(cache, hp);
+    return rc;
+}
 
 int nvmtl_vk_image_write_region_level(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes,
                                       uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level)
