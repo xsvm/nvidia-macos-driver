@@ -18,7 +18,7 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
 }
 @class NVMTLHeap;
 @interface NVMTLBuffer : NSObject <MTLBuffer> { @public nvk_buffer _b; MTLStorageMode _storage; NVMTLHeap *_heap; NSUInteger _heapOffset;
-    void *_hostPtr; size_t _hostLen; id _hostDealloc;
+    void *_hostPtr; size_t _hostLen; id _hostDealloc; BOOL _hostRO;
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
     NSUInteger _dirtyLo, _dirtyHi; } @end

@@ -1,0 +1,160 @@
+diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h	2026-11-10 00:16:08
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h	2026-11-10 00:17:48
+@@ -103,6 +103,7 @@
+    NvHandle hMemoryPhys;
+    bool isSystemMem;
+    void *hostPtr;   /* b72 host-pointer import: the caller's pages (map returns this, nothing to unmap); NULL otherwise */
++   bool deviceReadOnly;   /* RM made it DEVICE_READ_ONLY (a read-only host range): every GPU map must ask READ_ONLY */
+ };
+ 
+ NVKMD_DECL_SUBCLASS(mem, nvrm);
+diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c	2026-11-10 00:16:08
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c	2026-11-10 00:17:48
+@@ -15,6 +15,10 @@
+ #include "class/cl003e.h" // NV01_MEMORY_SYSTEM
+ #include "class/cl0040.h" // NV01_MEMORY_LOCAL_USER
+ #include "class/cl0071.h" // NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (b72 host-pointer import)
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#endif
+ #include "../../nvmtl_cfg.h"
+ 
+ /* nvk69: app memory that may be GPU-cached in L2 when it lands in system RAM. Defined here and in
+@@ -72,13 +76,14 @@
+ }
+ 
+ static VkResult
+-create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
+-                       struct vk_object_base *log_obj,
+-                       enum nvkmd_mem_flags mem_flags,
+-                       NvHandle hMemoryPhys, uint64_t size_B,
+-                       enum nvkmd_va_flags va_flags,
+-                       uint8_t pte_kind, uint64_t va_align_B,
+-                       struct nvkmd_mem **mem_out)
++create_mem_or_close_bo_ro(struct nvkmd_nvrm_dev *dev,
++                          struct vk_object_base *log_obj,
++                          enum nvkmd_mem_flags mem_flags,
++                          NvHandle hMemoryPhys, uint64_t size_B,
++                          enum nvkmd_va_flags va_flags,
++                          uint8_t pte_kind, uint64_t va_align_B,
++                          bool device_ro,
++                          struct nvkmd_mem **mem_out)
+ {
+    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
+    struct NvRmApi rm;
+@@ -101,6 +106,7 @@
+                   mem_flags, size_B, dev->base.pdev->bind_align_B);
+    mem->hMemoryPhys = hMemoryPhys;
+    mem->isSystemMem = (mem_flags & NVKMD_MEM_GART) != 0;
++   mem->deviceReadOnly = device_ro;
+ 
+    result = nvkmd_dev_alloc_va(&dev->base, log_obj,
+                                va_flags, pte_kind,
+@@ -129,6 +135,19 @@
+    return result;
+ }
+ 
++static VkResult
++create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_mem_flags mem_flags,
++                       NvHandle hMemoryPhys, uint64_t size_B,
++                       enum nvkmd_va_flags va_flags,
++                       uint8_t pte_kind, uint64_t va_align_B,
++                       struct nvkmd_mem **mem_out)
++{
++   return create_mem_or_close_bo_ro(dev, log_obj, mem_flags, hMemoryPhys, size_B, va_flags, pte_kind, va_align_B,
++                                    false, mem_out);
++}
++
+ VkResult
+ nvkmd_nvrm_alloc_mem(struct nvkmd_dev *dev,
+                         struct vk_object_base *log_obj,
+@@ -343,6 +362,36 @@
+  * them keeps them pinned until it passes. Handles are ours to name (0x5eb00000 range, clear of RM's generated
+  * 0xcaf....; a duplicate retries the next). Placement is always system RAM, GPU-uncached (NVRM_HOST_OS02_FLAGS). */
+ static uint32_t nvrm_host_handle_next;
++/* Whether every page of [ptr, ptr + size) is mapped writable in this task. WindowServer maps the images apps send it
++ * (CoreAnimation shared memory) read-only, and RM pins an OS descriptor for writing unless the allocation says
++ * NVOS02_FLAGS_ALLOC_USER_READ_ONLY, so a read-only range was refused (NV_STATUS 0x56) and the plugin copied the
++ * whole image with the CPU before every submission. A read-only range is now pinned read-only and mapped
++ * read-only for the GPU (RM sets DEVICE_READ_ONLY too), which is all the caller can ask of memory it cannot write. */
++static bool
++nvrm_host_range_writable(const void *ptr, uint64_t size_B)
++{
++#ifdef __APPLE__
++   mach_vm_address_t at = (mach_vm_address_t)(uintptr_t)ptr;
++   const mach_vm_address_t end = at + size_B;
++   while (at < end) {
++      mach_vm_address_t region = at;
++      mach_vm_size_t len = 0;
++      vm_region_basic_info_data_64_t info;
++      mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++      mach_port_t object = MACH_PORT_NULL;
++      if (mach_vm_region(mach_task_self(), &region, &len, VM_REGION_BASIC_INFO_64,
++                         (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
++         return true;   /* unknown: ask for write as before, and RM decides */
++      if (object != MACH_PORT_NULL)
++         mach_port_deallocate(mach_task_self(), object);
++      if (region > at || !(info.protection & VM_PROT_WRITE))
++         return false;
++      at = region + len;
++   }
++#endif
++   return true;
++}
++
+ VkResult
+ nvkmd_nvrm_import_host_mem(struct nvkmd_dev *_dev,
+                            struct vk_object_base *log_obj,
+@@ -362,25 +411,29 @@
+    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+    struct NvRmApi drm = rm;
+    drm.fd = pdev->devFd;
++   const bool writable = nvrm_host_range_writable(host_ptr, size_B);
++   const NvU32 os02 = NVRM_HOST_OS02_FLAGS |
++      (writable ? 0 : DRF_DEF(OS02, _FLAGS, _ALLOC_USER_READ_ONLY, _YES));
+    NV_STATUS st = NV_ERR_INSERT_DUPLICATE_NAME;
+    NvHandle h = 0;
+    for (int tries = 0; tries < 16 && st == NV_ERR_INSERT_DUPLICATE_NAME; tries++) {
+       h = 0x5eb00000u | (__atomic_add_fetch(&nvrm_host_handle_next, 1, __ATOMIC_RELAXED) & 0xfffffu);
+-      st = nvRmApiAllocMemory(&drm, pdev->hDevice, h, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, NVRM_HOST_OS02_FLAGS, host_ptr, size_B - 1);
++      st = nvRmApiAllocMemory(&drm, pdev->hDevice, h, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, os02, host_ptr, size_B - 1);
+    }
+    if (st != NV_OK)
+-      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "NV_ESC_RM_ALLOC_MEMORY(OS descriptor %p, %llu B) -> NV_STATUS %#x",
+-                       host_ptr, (unsigned long long)size_B, st);
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "NV_ESC_RM_ALLOC_MEMORY(OS descriptor %p, %llu B, %s) -> NV_STATUS %#x",
++                       host_ptr, (unsigned long long)size_B, writable ? "rw" : "ro", st);
+    flags &= ~(NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM | NVKMD_MEM_BAR | NVK69_MEM_GPU_CACHED);
+    flags |= NVKMD_MEM_GART | NVKMD_MEM_CAN_MAP;
+    struct nvkmd_mem *mem = NULL;
+-   VkResult r = create_mem_or_close_bo(dev, log_obj, flags, h, size_B, NVKMD_VA_GART, 0 /* pte_kind */, pg, &mem);
++   VkResult r = create_mem_or_close_bo_ro(dev, log_obj, flags, h, size_B, NVKMD_VA_GART, 0 /* pte_kind */, pg,
++                                          !writable, &mem);
+    if (r != VK_SUCCESS)
+       return r;   /* create_mem_or_close_bo already freed h, which unpins */
+    nvkmd_nvrm_mem(mem)->hostPtr = host_ptr;
+    { static uint64_t n; if ((n++ == 0 || (n & 0x3ff) == 0) && nvkmd_nvrm_diag_on())
+-        fprintf(stderr, "nvrm: host pointer IMPORTED #%llu: %p, %llu KB, zero copy (handle %#x)\n",
+-                (unsigned long long)n, host_ptr, (unsigned long long)(size_B >> 10), h); }
++        fprintf(stderr, "nvrm: host pointer IMPORTED #%llu: %p, %llu KB, %s, zero copy (handle %#x)\n",
++                (unsigned long long)n, host_ptr, (unsigned long long)(size_B >> 10), writable ? "rw" : "read-only", h); }
+    *mem_out = mem;
+    return VK_SUCCESS;
+ }
+diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c	2026-11-10 00:16:07
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c	2026-11-10 00:17:48
+@@ -169,6 +169,8 @@
+ 
+    NvU32 gpuMapFlags = 0;
+    gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _PAGE_KIND, _VIRTUAL);
++   if (mem->deviceReadOnly)   /* RM refuses a READ_WRITE map of DEVICE_READ_ONLY memory (rmapi/mapping.c) */
++      gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _ACCESS, _READ_ONLY);
+    if (mem->isSystemMem) {
+       gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE);
+    } else {

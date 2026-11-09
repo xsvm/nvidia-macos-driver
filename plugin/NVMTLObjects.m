@@ -7726,7 +7726,7 @@ static void nvmtl_buffer_sync_out(NVMTLBuffer *b)
             if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_b, 0, &b->_shadow, 0, b->_b.size)) nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size); }
         return;
     }
-    if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen) return;
+    if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen || b->_hostRO) return;
     const uint64_t t0 = nvmtl_perf_now();
     memcpy(b->_hostPtr, b->_b.map, b->_hostLen);
     nvmtl_perf_note(NVP_SYNCOUT, t0, b->_hostLen);

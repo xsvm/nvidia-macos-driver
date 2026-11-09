@@ -52,7 +52,7 @@ jobs:
           curl -fsSL -o mesa.tar.gz "https://gitlab.freedesktop.org/mesa/mesa/-/archive/$base/mesa-$base.tar.gz"
           mkdir mesa && tar -xzf mesa.tar.gz -C mesa --strip-components=1
           cd mesa
-          for p in nvk-macos.patch nvk-fixes-after-def16.patch nvk-620-kernel.patch; do
+          for p in nvk-macos.patch nvk-fixes-after-def16.patch nvk-620-kernel.patch nvk-host-import-ro.patch; do
             patch -p1 -s --forward < "../repo/nvk/$p"
           done
           if [ "${{ matrix.variant }}" = lazy ]; then patch -p1 -s --forward < ../repo/nvk/nvk-event-lazy.patch; fi

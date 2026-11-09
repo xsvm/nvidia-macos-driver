@@ -7,6 +7,7 @@
 #import <Metal/Metal.h>
 #import "NVMTLObjects.h"
 #import <IOSurface/IOSurfaceRef.h>
+#include <mach/mach_vm.h>
 @implementation NVMTLDevice (Contract)
 - (NSUInteger)doubleFPConfig { return 0; }
 - (NSUInteger)featureProfile { return 10002; }
@@ -16,6 +17,21 @@
 - (BOOL)metalAssertionsEnabled { return NO; }
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)a0 { return 256; }
 static void nvbt(const char *tag, int *count, int max);
+// Whether this task can write every byte of [p, p + n). WindowServer maps the images apps send it read-only.
+static BOOL nvmtl_host_range_writable(const void *p, size_t n)
+{
+    mach_vm_address_t at = (mach_vm_address_t)(uintptr_t)p; const mach_vm_address_t end = at + n;
+    while (at < end) {
+        mach_vm_address_t region = at; mach_vm_size_t len = 0; vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &region, &len, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+            return NO;
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (region > at || !(info.protection & VM_PROT_WRITE)) return NO;
+        at = region + len;
+    }
+    return YES;
+}
 - (id)newBufferWithBytesNoCopy:(void *)a0 length:(NSUInteger)a1 options:(NSUInteger)a2 deallocator:(id)a3
 {
     const MTLStorageMode sm = (MTLStorageMode)((a2 >> MTLResourceStorageModeShift) & 0xF);
@@ -79,6 +95,9 @@ static void nvbt(const char *tag, int *count, int max);
     }
     memcpy(b->_b.map, a0, a1);
     b->_hostPtr = a0; b->_hostLen = (size_t)a1;
+    // Read-only pages (an app's image in WindowServer) are never written back: the GPU's copy cannot have anything the
+    // caller could see, and the write-back faulted (SIGBUS) at the first completed submission.
+    b->_hostRO = !nvmtl_host_range_writable(a0, (size_t)a1);
     { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: COPIED %lu bytes at %p (import alignment %zu) \u2014 resynced at every submission",
                                           (unsigned long)a1, a0, nvmtl_vk_host_import_align()); }
     return b;
