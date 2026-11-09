@@ -25,7 +25,7 @@ fixture = r'''
 #include <string.h>
 typedef struct { void *map; size_t size; } Buffer;
 @interface NVMTLBuffer : NSObject { @public
-    void *_hostPtr; size_t _hostLen; Buffer _b, _shadow; unsigned _syncOut, _zshadow;
+    void *_hostPtr; size_t _hostLen; BOOL _hostRO; Buffer _b, _shadow; unsigned _syncOut, _zshadow;
 } @end
 @implementation NVMTLBuffer @end
 @interface NVMTLTexture : NSObject { @public
